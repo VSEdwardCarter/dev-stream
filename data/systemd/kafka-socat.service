@@ -1,0 +1,17 @@
+[Unit]
+Description=Kafka NodePort socat forward (localhost:9092 -> 192.168.0.146:30992)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+ExecStart=/usr/bin/socat TCP-LISTEN:9092,fork,reuseaddr TCP:192.168.0.146:30992
+
+# If you run as a user service, 9092 is >1024 so no sudo needed.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

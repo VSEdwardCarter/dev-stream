@@ -1,0 +1,34 @@
+[Unit]
+Description=Landing Zone Kafka Consumer (signals -> JSONL)
+After=network-online.target
+Wants=network-online.target
+After=kafka-socat.service
+Wants=kafka-socat.service
+
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+
+# Run as your user
+User=%i
+WorkingDirectory=/home/%i/landing-zone
+
+Environment=TOPIC=signals
+Environment=GROUP_ID=landing-popos-signals-v1
+Environment=BOOTSTRAP_SERVERS=kafka-controller-0.kafka-controller-headless.infra.svc.cluster.local:9092
+Environment=LANDING_ROOT=/home/%i/landing-zone/landing
+Environment=CHECKPOINT_PATH=/home/%i/landing-zone/checkpoints/signals/offsets.json
+Environment=LOG_PATH=/home/%i/landing-zone/logs/landing-consumer.log
+
+ExecStart=/home/%i/landing-zone/.venv/bin/python /home/%i/landing-zone/bin/landing_consumer.py
+
+# Hardening (lightweight)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=default.target
