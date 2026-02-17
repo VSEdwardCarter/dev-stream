@@ -4,7 +4,6 @@ import sys
 import json
 import time
 import signal
-import errno
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
@@ -14,12 +13,11 @@ from kafka import KafkaConsumer, TopicPartition
 def parse_event_dt(payload: Dict[str, Any], kafka_ts_ms: Optional[int]) -> datetime:
     """
     Prefer payload["ts"] if present (ISO8601). Fall back to Kafka message timestamp, then now().
-    Returns timezone-aware datetime in local UTC.
+    Returns timezone-aware datetime in UTC.
     """
     ts = payload.get("ts")
     if isinstance(ts, str):
         try:
-            # Handles "2026-02-15T16:05:33-07:00" and "2026-02-15T23:05:33+00:00"
             dt = datetime.fromisoformat(ts)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
@@ -38,12 +36,16 @@ def ensure_dir(path: str) -> None:
 
 
 def atomic_write_json(path: str, obj: Any) -> None:
+    """
+    Atomic write (same filesystem): write tmp + fsync + rename.
+    """
     tmp = f"{path}.tmp"
+    ensure_dir(os.path.dirname(path))
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)  # atomic on same filesystem
+    os.replace(tmp, path)
 
 
 def load_checkpoint(path: str) -> Dict[str, Dict[str, int]]:
@@ -51,7 +53,6 @@ def load_checkpoint(path: str) -> Dict[str, Dict[str, int]]:
         return {}
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # normalize to ints
     out: Dict[str, Dict[str, int]] = {}
     for topic, parts in (data or {}).items():
         out[topic] = {str(p): int(o) for p, o in (parts or {}).items()}
@@ -59,7 +60,6 @@ def load_checkpoint(path: str) -> Dict[str, Dict[str, int]]:
 
 
 def open_append(path: str):
-    # line-buffered append; we still fsync after writes for durability
     ensure_dir(os.path.dirname(path))
     return open(path, "a", encoding="utf-8")
 
@@ -71,7 +71,6 @@ class LandingWriter:
         self._open_files: Dict[str, Any] = {}  # path -> file handle
 
     def _path_for_dt(self, dt_utc: datetime) -> str:
-        # Partition by UTC date/hour (change to local if you want)
         d = dt_utc.strftime("%Y-%m-%d")
         h = dt_utc.strftime("%H")
         ymdh = dt_utc.strftime("%Y%m%d-%H")
@@ -105,9 +104,8 @@ class LandingWriter:
         self._open_files.clear()
 
 
-def main():
+def main() -> int:
     topic = os.environ.get("TOPIC", "signals")
-    group_id = os.environ.get("GROUP_ID", "landing-popos-signals-v1")
 
     bootstrap = os.environ.get(
         "BOOTSTRAP_SERVERS",
@@ -145,12 +143,12 @@ def main():
         with open(log_path, "a", encoding="utf-8") as lf:
             lf.write(line + "\n")
 
+    # IMPORTANT: No consumer group. We do local checkpointing + manual assign.
     consumer = KafkaConsumer(
-        topic,
         bootstrap_servers=bootstrap,
-        group_id=group_id,
-        enable_auto_commit=False,      # we control checkpointing
-        auto_offset_reset="earliest",  # used only if no checkpoint exists
+        group_id=None,
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
         value_deserializer=lambda v: v.decode("utf-8", errors="replace"),
         consumer_timeout_ms=1000,
         api_version_auto_timeout_ms=10000,
@@ -159,30 +157,40 @@ def main():
         max_poll_records=500,
     )
 
-    log(f"Started landing consumer: topic={topic} group_id={group_id} bootstrap={bootstrap}")
+    log(f"Started landing consumer: topic={topic} (no group) bootstrap={bootstrap}")
     log(f"Landing root: {landing_root}")
     log(f"Checkpoint: {checkpoint_path}")
 
-    # Wait for partition assignment
-    while running and not consumer.assignment():
-        consumer.poll(timeout_ms=500)
+    # Discover topic partitions + assign manually (more reliable than group assignment here)
+    parts = None
+    while running and not parts:
+        parts = consumer.partitions_for_topic(topic)
+        if not parts:
+            log(f"Waiting for topic metadata: {topic}")
+            time.sleep(0.5)
 
-    assigned = list(consumer.assignment())
-    if not assigned:
-        log("No partitions assigned (yet). Exiting.")
+    if not parts:
+        log("No partitions discovered. Exiting.")
+        consumer.close()
         return 2
 
-    # Seek to checkpoint+1 for each assigned partition if present
-    for tp in assigned:
+    tps = [TopicPartition(topic, p) for p in sorted(parts)]
+    consumer.assign(tps)
+    log(f"Assigned partitions: {sorted(parts)}")
+
+    # Seek from checkpoint or beginning
+    for tp in tps:
         p = str(tp.partition)
         if p in last_offsets:
             seek_to = last_offsets[p] + 1
             consumer.seek(tp, seek_to)
             log(f"Seek {topic}[{p}] -> {seek_to} (from checkpoint)")
         else:
-            log(f"{topic}[{p}] no checkpoint, using auto_offset_reset policy")
+            consumer.seek_to_beginning(tp)
+            log(f"Seek {topic}[{p}] -> beginning (no checkpoint)")
 
-    # Consume loop
+    log("Entering consume loop...")
+
     processed = 0
     while running:
         records = consumer.poll(timeout_ms=1000)
@@ -198,7 +206,6 @@ def main():
                     continue  # idempotent on restart
 
                 raw = m.value
-                payload: Dict[str, Any]
                 try:
                     payload = json.loads(raw)
                     if not isinstance(payload, dict):
@@ -223,7 +230,7 @@ def main():
                 atomic_write_json(checkpoint_path, ckpt)
 
                 processed += 1
-                if processed % 500 == 0:
+                if processed == 1 or processed % 50 == 0:
                     log(f"Processed {processed} records (latest wrote: {out_path})")
 
     log("Shutting down...")
