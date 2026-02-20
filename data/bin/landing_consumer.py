@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-# ============================================================
-# Landing Zone Kafka Consumer (signals -> JSONL)
-#
-# Architecture framing:
-#   EXTRACT  = read events from Kafka (manual partition assign)
-#   TRANSFORM= parse timestamps, compute lateness, compute scores
-#   AI DECISION = decide route (landing/delayed/quarantine)
-#   LOAD     = append-only JSONL write, partitioned by dt/hr
-#   DURABILITY/CHECKPOINT = fsync writes + atomic state + atomic offsets
-# ============================================================
-
 import os
 import sys
 import json
@@ -24,12 +13,13 @@ from kafka import KafkaConsumer, TopicPartition
 # ----------------------------
 # CONFIG DEFAULTS
 # ----------------------------
-LATE_THRESHOLD_SEC_DEFAULT = 300          # 5 minutes
-IMPACT_THRESHOLD_DEFAULT = 0.33           # quarantine if >= this (you tuned to 0.95 via systemd env)
-OPS_IQR_K_DEFAULT = 3.0                   # ops anomaly if lateness > median + k*IQR
-OPS_MIN_SAMPLES_DEFAULT = 20              # need at least N samples per source
-OPS_WINDOW_DEFAULT = 200                  # keep last N lateness samples per source
-IMPACT_WINDOW_MINUTES_DEFAULT = 60        # keep last N minutes of per-minute counts
+LATE_THRESHOLD_SEC_DEFAULT = 300           # 5 minutes
+IMPACT_THRESHOLD_DEFAULT = 0.33            # quarantine if >= this (you set to 0.95 via systemd env)
+OPS_IQR_K_DEFAULT = 3.0                    # ops anomaly if lateness > median + k*IQR
+OPS_MIN_SAMPLES_DEFAULT = 20               # need at least N samples per source
+OPS_WINDOW_DEFAULT = 200                   # keep last N lateness samples per source
+IMPACT_WINDOW_MINUTES_DEFAULT = 60         # keep last N minutes of per-minute counts
+OPS_ZERO_IQR_FLOOR_SEC_DEFAULT = 60        # when IQR=0, require at least this many seconds to call it anomalous
 
 
 # ============================================================
@@ -38,7 +28,7 @@ IMPACT_WINDOW_MINUTES_DEFAULT = 60        # keep last N minutes of per-minute co
 def parse_event_dt(payload: Dict[str, Any], kafka_ts_ms: Optional[int]) -> datetime:
     """
     Prefer payload["ts"] if present (ISO8601). Fall back to Kafka message timestamp, then now().
-    Normalizes to timezone-aware UTC datetime.
+    Returns timezone-aware datetime in UTC.
     """
     ts = payload.get("ts")
     if isinstance(ts, str):
@@ -174,11 +164,10 @@ def median_iqr(values: List[float]) -> Tuple[float, float, float, float]:
     return med, q1, q3, iqr
 
 
+# ============================================================
+# CHECKPOINT: offsets.json
+# ============================================================
 def load_checkpoint(path: str) -> Dict[str, Dict[str, int]]:
-    """
-    DURABILITY/CHECKPOINT:
-      offsets.json stores last processed Kafka offset per partition.
-    """
     if not os.path.exists(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -229,10 +218,11 @@ def main() -> int:
     ops_iqr_k = float(os.environ.get("OPS_IQR_K", str(OPS_IQR_K_DEFAULT)))
     ops_min_samples = int(os.environ.get("OPS_MIN_SAMPLES", str(OPS_MIN_SAMPLES_DEFAULT)))
     ops_window = int(os.environ.get("OPS_WINDOW", str(OPS_WINDOW_DEFAULT)))
+    ops_zero_iqr_floor_sec = int(os.environ.get("OPS_ZERO_IQR_FLOOR_SEC", str(OPS_ZERO_IQR_FLOOR_SEC_DEFAULT)))
 
     impact_window_minutes = int(os.environ.get("IMPACT_WINDOW_MINUTES", str(IMPACT_WINDOW_MINUTES_DEFAULT)))
 
-    # Ensure dirs exist (so writes never fail due to missing folders)
+    # Ensure dirs exist
     ensure_dir(os.path.dirname(log_path))
     ensure_dir(os.path.dirname(checkpoint_path))
     ensure_dir(os.path.dirname(alerts_path))
@@ -240,6 +230,51 @@ def main() -> int:
     ensure_dir(landing_root)
     ensure_dir(delayed_root)
     ensure_dir(quarantine_root)
+
+    # ----------------------------
+    # Logging helper
+    # ----------------------------
+    def log(msg: str):
+        ts = datetime.now(tz=timezone.utc).isoformat()
+        line = f"{ts} {msg}"
+        print(line, flush=True)
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(line + "\n")
+
+    def write_alert(alert_obj: Dict[str, Any]) -> None:
+        with open(alerts_path, "a", encoding="utf-8") as af:
+            af.write(json.dumps(alert_obj, separators=(",", ":"), ensure_ascii=False) + "\n")
+            af.flush()
+            os.fsync(af.fileno())
+
+    # ----------------------------
+    # STARTUP CONFIG LOG (single place to see everything)
+    # ----------------------------
+    log("========== Landing Consumer Configuration ==========")
+    log(f"topic={topic}")
+    log(f"bootstrap={bootstrap}")
+
+    log("---- Late Policy ----")
+    log(f"late_threshold_sec={late_threshold_sec}")
+
+    log("---- Impact Policy ----")
+    log(f"impact_threshold={impact_threshold}")
+    log(f"impact_window_minutes={impact_window_minutes}")
+
+    log("---- Ops (Pipeline Health) Policy ----")
+    log(f"ops_iqr_k={ops_iqr_k}")
+    log(f"ops_min_samples={ops_min_samples}")
+    log(f"ops_window={ops_window}")
+    log(f"ops_zero_iqr_floor_sec={ops_zero_iqr_floor_sec}")
+
+    log("---- Paths ----")
+    log(f"landing_root={landing_root}")
+    log(f"delayed_root={delayed_root}")
+    log(f"quarantine_root={quarantine_root}")
+    log(f"checkpoint_path={checkpoint_path}")
+    log(f"state_path={state_path}")
+    log(f"alerts_path={alerts_path}")
+    log("=====================================================")
 
     # ----------------------------
     # DURABILITY/CHECKPOINT: load offsets + state
@@ -261,6 +296,9 @@ def main() -> int:
     writer_delayed = PartitionedWriter(root=delayed_root, topic=topic)
     writer_quarantine = PartitionedWriter(root=quarantine_root, topic=topic)
 
+    # ----------------------------
+    # Shutdown handling
+    # ----------------------------
     running = True
 
     def handle_stop(signum, frame):
@@ -270,21 +308,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_stop)
     signal.signal(signal.SIGTERM, handle_stop)
 
-    def log(msg: str):
-        ts = datetime.now(tz=timezone.utc).isoformat()
-        line = f"{ts} {msg}"
-        print(line, flush=True)
-        with open(log_path, "a", encoding="utf-8") as lf:
-            lf.write(line + "\n")
-
-    def write_alert(alert_obj: Dict[str, Any]) -> None:
-        with open(alerts_path, "a", encoding="utf-8") as af:
-            af.write(json.dumps(alert_obj, separators=(",", ":"), ensure_ascii=False) + "\n")
-            af.flush()
-            os.fsync(af.fileno())
-
+    # ----------------------------
+    # State helpers
+    # ----------------------------
     def prune_minute_counts(now_utc: datetime) -> None:
-        # Keep only last N minutes of buckets
         cutoff = floor_to_minute(now_utc).timestamp() - (impact_window_minutes * 60)
         to_del = []
         for k in list(minute_counts.keys()):
@@ -297,9 +324,9 @@ def main() -> int:
         for k in to_del:
             minute_counts.pop(k, None)
 
-    # ----------------------------
-    # TRANSFORM: ops-lane scoring
-    # ----------------------------
+    # ============================================================
+    # OPS LANE: lateness shift anomaly per source (median + IQR)
+    # ============================================================
     def ops_anomaly_for(source: str, lateness_sec: int) -> Dict[str, Any]:
         vals = source_lateness.get(source, [])
         if len(vals) < ops_min_samples:
@@ -313,8 +340,15 @@ def main() -> int:
             }
 
         med, q1, q3, iqr = median_iqr([float(x) for x in vals])
-        upper = med + (ops_iqr_k * iqr)
-        status_anom = float(lateness_sec) > upper if iqr > 0 else float(lateness_sec) > med
+
+        # Important fix: if baseline has IQR=0 (often all zeros),
+        # require a minimum floor so any tiny non-zero delay doesn't look "anomalous".
+        if iqr > 0:
+            upper = med + (ops_iqr_k * iqr)
+        else:
+            upper = med + float(ops_zero_iqr_floor_sec)
+
+        status_anom = float(lateness_sec) > upper
 
         return {
             "status_anomaly": bool(status_anom),
@@ -327,11 +361,10 @@ def main() -> int:
             "upper_bound": upper,
         }
 
-    # ----------------------------
-    # TRANSFORM: impact-lane scoring
-    # ----------------------------
+    # ============================================================
+    # IMPACT LANE: global per-minute counts (simple "current situation" proxy)
+    # ============================================================
     def impact_score_for(event_dt_utc: datetime) -> Dict[str, Any]:
-        # Global per-minute bucket impact: 1/(1+count_before)
         minute_key = iso_minute(event_dt_utc)
         count_before = int(minute_counts.get(minute_key, 0))
         score = 1.0 / (1.0 + float(count_before))
@@ -342,10 +375,8 @@ def main() -> int:
         }
 
     # ============================================================
-    # EXTRACT: Kafka consumer (manual partition assignment)
+    # EXTRACT: Kafka consumer (manual partition assignment; no group)
     # ============================================================
-    # We avoid consumer groups because your environment showed assignment flakiness.
-    # Manual assignment + local checkpoint makes the behavior deterministic.
     consumer = KafkaConsumer(
         bootstrap_servers=bootstrap,
         group_id=None,
@@ -358,12 +389,6 @@ def main() -> int:
         session_timeout_ms=10000,
         max_poll_records=500,
     )
-
-    log(f"Started landing consumer: topic={topic} (no group) bootstrap={bootstrap}")
-    log(f"Policy: late_threshold_sec={late_threshold_sec} impact_threshold={impact_threshold}")
-    log(f"Ops: per-source median+IQR, k={ops_iqr_k} min_samples={ops_min_samples} window={ops_window}")
-    log(f"Impact: global per-minute counts, window_minutes={impact_window_minutes}")
-    log(f"Checkpoint={checkpoint_path} State={state_path} Alerts={alerts_path}")
 
     # Discover partitions + assign
     parts = None
@@ -382,16 +407,16 @@ def main() -> int:
     consumer.assign(tps)
     log(f"Assigned partitions: {sorted(parts)}")
 
-    # DURABILITY/CHECKPOINT: seek from checkpoint
+    # Seek from checkpoint
     for tp in tps:
-        p = str(tp.partition)
-        if p in last_offsets:
-            seek_to = last_offsets[p] + 1
+        part_str = str(tp.partition)
+        if part_str in last_offsets:
+            seek_to = last_offsets[part_str] + 1
             consumer.seek(tp, seek_to)
-            log(f"Seek {topic}[{p}] -> {seek_to} (from checkpoint)")
+            log(f"Seek {topic}[{part_str}] -> {seek_to} (from checkpoint)")
         else:
             consumer.seek_to_beginning(tp)
-            log(f"Seek {topic}[{p}] -> beginning (no checkpoint)")
+            log(f"Seek {topic}[{part_str}] -> beginning (no checkpoint)")
 
     log("Entering consume loop...")
 
@@ -400,21 +425,20 @@ def main() -> int:
     # ============================================================
     processed = 0
     while running:
-        # EXTRACT: poll Kafka
         records = consumer.poll(timeout_ms=1000)
         if not records:
             continue
 
         for tp, msgs in records.items():
-            p = str(tp.partition)
-            last = int(last_offsets.get(p, -1))
+            part_str = str(tp.partition)
+            last = int(last_offsets.get(part_str, -1))
 
             for m in msgs:
-                # DURABILITY: idempotent skip if we already processed this offset
+                # Idempotency on restart
                 if m.offset <= last:
                     continue
 
-                # TRANSFORM: parse JSON payload
+                # Parse payload JSON
                 raw = m.value
                 try:
                     payload = json.loads(raw)
@@ -423,7 +447,7 @@ def main() -> int:
                 except Exception:
                     payload = {"raw": raw}
 
-                # TRANSFORM: compute event time, ingest time, lateness
+                # Compute event time + lateness
                 event_dt_utc = parse_event_dt(payload, m.timestamp)
                 ingest_dt_utc = datetime.now(tz=timezone.utc)
                 lateness_sec = int((ingest_dt_utc - event_dt_utc).total_seconds())
@@ -431,9 +455,9 @@ def main() -> int:
                     lateness_sec = 0
 
                 source = str(payload.get("source", "unknown"))
-
-                # AI DECISION inputs (only meaningful for late records)
                 is_late = lateness_sec > late_threshold_sec
+
+                # Compute lane signals (only meaningful for late)
                 ops_info = ops_anomaly_for(source, lateness_sec) if is_late else {
                     "status_anomaly": False,
                     "reason": "not_late",
@@ -448,9 +472,9 @@ def main() -> int:
                     "impact_score": 0.0,
                 }
 
-                # ============================================================
-                # AI DECISION: routing logic
-                # ============================================================
+                # ----------------------------
+                # AI DECISION: routing
+                # ----------------------------
                 if not is_late:
                     route = "landing"
                     reason = "on_time_or_within_threshold"
@@ -464,7 +488,7 @@ def main() -> int:
                         route = "delayed"
                         reason = "late_low_impact_and_stable_pipeline"
 
-                # TRANSFORM: enrich record with kafka + decision metadata
+                # Enrich record
                 record = dict(payload)
                 record["_kafka"] = {
                     "topic": m.topic,
@@ -483,9 +507,9 @@ def main() -> int:
                     "impact": impact_info,
                 }
 
-                # ============================================================
-                # LOAD: write append-only JSONL (partitioned by EVENT time)
-                # ============================================================
+                # ----------------------------
+                # LOAD: write routed output
+                # ----------------------------
                 if route == "landing":
                     out_path = writer_landing.write_jsonl(event_dt_utc, record)
                 elif route == "delayed":
@@ -493,12 +517,9 @@ def main() -> int:
                 else:
                     out_path = writer_quarantine.write_jsonl(event_dt_utc, record)
 
-                # ============================================================
-                # DURABILITY / STATE: update local "AI state"
-                #   - minute_counts for impact lane
-                #   - per-source lateness distribution for ops lane
-                # Persist atomically so restart is safe.
-                # ============================================================
+                # ----------------------------
+                # UPDATE STATE (atomic)
+                # ----------------------------
                 mk = iso_minute(event_dt_utc)
                 minute_counts[mk] = int(minute_counts.get(mk, 0)) + 1
                 prune_minute_counts(ingest_dt_utc)
@@ -511,14 +532,14 @@ def main() -> int:
 
                 atomic_write_json(state_path, {"source_lateness": source_lateness, "minute_counts": minute_counts})
 
-                # ============================================================
-                # DURABILITY / CHECKPOINT: advance offset only AFTER durable write
-                # ============================================================
-                last_offsets[p] = m.offset
+                # ----------------------------
+                # CHECKPOINT AFTER durable write
+                # ----------------------------
+                last_offsets[part_str] = m.offset
                 ckpt[topic] = last_offsets
                 atomic_write_json(checkpoint_path, ckpt)
 
-                # Alerts only for quarantine
+                # Alerts on quarantine
                 if route == "quarantine":
                     alert = {
                         "ts_utc": ingest_dt_utc.isoformat(),
