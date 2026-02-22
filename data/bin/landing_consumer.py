@@ -4,26 +4,32 @@ import sys
 import json
 import time
 import signal
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Tuple, List
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List, Tuple
 
 from kafka import KafkaConsumer, TopicPartition
 
 
 # ----------------------------
-# CONFIG DEFAULTS
+# Defaults
 # ----------------------------
-LATE_THRESHOLD_SEC_DEFAULT = 300           # 5 minutes
-IMPACT_THRESHOLD_DEFAULT = 0.33            # quarantine if >= this (you set to 0.95 via systemd env)
-OPS_IQR_K_DEFAULT = 3.0                    # ops anomaly if lateness > median + k*IQR
-OPS_MIN_SAMPLES_DEFAULT = 20               # need at least N samples per source
-OPS_WINDOW_DEFAULT = 200                   # keep last N lateness samples per source
-IMPACT_WINDOW_MINUTES_DEFAULT = 60         # keep last N minutes of per-minute counts
-OPS_ZERO_IQR_FLOOR_SEC_DEFAULT = 60        # when IQR=0, require at least this many seconds to call it anomalous
+LATE_THRESHOLD_SEC_DEFAULT = 300  # 5 minutes
+
+# Impact: simple proxy (retro minute bucket density)
+IMPACT_THRESHOLD_DEFAULT = 0.95  # you can tune; higher = fewer quarantines by impact
+IMPACT_WINDOW_MINUTES_DEFAULT = 120
+
+# Ops health: rolling late-rate / late-count (GLOBAL)
+OPS_LATE_WINDOW_MINUTES_DEFAULT = 5
+OPS_LATE_RATE_THRESHOLD_DEFAULT = 0.20
+OPS_LATE_COUNT_THRESHOLD_DEFAULT = 200
+
+# Warm-up guard: do not allow impact-based quarantine unless bucket already has volume
+MIN_BUCKET_COUNT_DEFAULT = 10
 
 
 # ============================================================
-# TRANSFORM HELPERS: time parsing
+# Time helpers
 # ============================================================
 def parse_event_dt(payload: Dict[str, Any], kafka_ts_ms: Optional[int]) -> datetime:
     """
@@ -46,8 +52,16 @@ def parse_event_dt(payload: Dict[str, Any], kafka_ts_ms: Optional[int]) -> datet
     return datetime.now(tz=timezone.utc)
 
 
+def floor_to_minute(dt_utc: datetime) -> datetime:
+    return dt_utc.replace(second=0, microsecond=0)
+
+
+def iso_minute(dt_utc: datetime) -> str:
+    return floor_to_minute(dt_utc).isoformat().replace("+00:00", "Z")
+
+
 # ============================================================
-# DURABILITY HELPERS: directories + atomic JSON
+# Filesystem helpers (durability)
 # ============================================================
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -55,11 +69,10 @@ def ensure_dir(path: str) -> None:
 
 def atomic_write_json(path: str, obj: Any) -> None:
     """
-    Atomic write on same filesystem:
-      write tmp -> fsync -> rename/replace
+    Atomic write: write tmp -> fsync -> replace.
     """
-    tmp = f"{path}.tmp"
     ensure_dir(os.path.dirname(path))
+    tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
         f.flush()
@@ -80,17 +93,18 @@ def open_append(path: str):
 
 
 # ============================================================
-# LOAD: append-only, partitioned JSONL writer
+# Append-only partitioned JSONL writers
 # ============================================================
 class PartitionedWriter:
     """
-    Append-only JSONL with dt/hr partitioning.
-    Keeps open handles per path; flush+fsync each write for durability.
+    Writes JSONL partitioned by dt/hr:
+      root/topic/dt=YYYY-MM-DD/hr=HH/topic-YYYYMMDD-HH.jsonl
+    Keeps open file handles per path. Flush+fsync each record (durable).
     """
     def __init__(self, root: str, topic: str):
         self.root = root
         self.topic = topic
-        self._open_files: Dict[str, Any] = {}
+        self._open: Dict[str, Any] = {}
 
     def _path_for_dt(self, dt_utc: datetime) -> str:
         d = dt_utc.strftime("%Y-%m-%d")
@@ -106,10 +120,10 @@ class PartitionedWriter:
 
     def write_jsonl(self, dt_utc: datetime, record: Dict[str, Any]) -> str:
         path = self._path_for_dt(dt_utc)
-        f = self._open_files.get(path)
+        f = self._open.get(path)
         if f is None:
             f = open_append(path)
-            self._open_files[path] = f
+            self._open[path] = f
 
         line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
         f.write(line)
@@ -118,54 +132,16 @@ class PartitionedWriter:
         return path
 
     def close_all(self):
-        for f in self._open_files.values():
+        for f in self._open.values():
             try:
                 f.close()
             except Exception:
                 pass
-        self._open_files.clear()
+        self._open.clear()
 
 
 # ============================================================
-# TRANSFORM HELPERS: robust stats (median/IQR)
-# ============================================================
-def _median(sorted_vals: List[float]) -> float:
-    n = len(sorted_vals)
-    if n == 0:
-        return 0.0
-    mid = n // 2
-    if n % 2 == 1:
-        return float(sorted_vals[mid])
-    return (float(sorted_vals[mid - 1]) + float(sorted_vals[mid])) / 2.0
-
-
-def _quantile(sorted_vals: List[float], q: float) -> float:
-    n = len(sorted_vals)
-    if n == 0:
-        return 0.0
-    if n == 1:
-        return float(sorted_vals[0])
-    pos = q * (n - 1)
-    lo = int(pos)
-    hi = min(lo + 1, n - 1)
-    frac = pos - lo
-    return float(sorted_vals[lo]) * (1.0 - frac) + float(sorted_vals[hi]) * frac
-
-
-def median_iqr(values: List[float]) -> Tuple[float, float, float, float]:
-    """
-    Returns (median, q1, q3, iqr)
-    """
-    s = sorted(values)
-    med = _median(s)
-    q1 = _quantile(s, 0.25)
-    q3 = _quantile(s, 0.75)
-    iqr = max(0.0, q3 - q1)
-    return med, q1, q3, iqr
-
-
-# ============================================================
-# CHECKPOINT: offsets.json
+# Checkpoint offsets (durable)
 # ============================================================
 def load_checkpoint(path: str) -> Dict[str, Dict[str, int]]:
     if not os.path.exists(path):
@@ -178,20 +154,75 @@ def load_checkpoint(path: str) -> Dict[str, Dict[str, int]]:
     return out
 
 
-def floor_to_minute(dt_utc: datetime) -> datetime:
-    return dt_utc.replace(second=0, microsecond=0)
+# ============================================================
+# Ops Health (GLOBAL): rolling late-rate / late-count
+# ============================================================
+def rolling_window_keys(now_utc: datetime, window_minutes: int) -> List[str]:
+    now_min = floor_to_minute(now_utc)
+    return [
+        iso_minute(now_min - timedelta(minutes=i))
+        for i in range(max(1, window_minutes))
+    ]
 
 
-def iso_minute(dt_utc: datetime) -> str:
-    return floor_to_minute(dt_utc).isoformat().replace("+00:00", "Z")
+def ops_anomaly_rolling(
+        now_utc: datetime,
+        minute_total: Dict[str, int],
+        minute_late: Dict[str, int],
+        window_minutes: int,
+        rate_threshold: float,
+        count_threshold: int,
+) -> Dict[str, Any]:
+    keys = rolling_window_keys(now_utc, window_minutes)
+
+    total = sum(int(minute_total.get(k, 0)) for k in keys)
+    late = sum(int(minute_late.get(k, 0)) for k in keys)
+
+    rate = (late / total) if total > 0 else 0.0
+
+    status = (rate > rate_threshold) or (late > count_threshold)
+    if rate > rate_threshold:
+        reason = "late_rate_high"
+    elif late > count_threshold:
+        reason = "late_count_high"
+    else:
+        reason = "ok"
+
+    return {
+        "status_anomaly": bool(status),
+        "reason": reason,
+        "window_minutes": window_minutes,
+        "late_rate": rate,
+        "late_count": late,
+        "total_count": total,
+        "thresholds": {
+            "late_rate_threshold": rate_threshold,
+            "late_count_threshold": count_threshold,
+        },
+        "keys_tail": keys[:3],  # tiny hint of window (most recent 3)
+    }
 
 
 # ============================================================
-# MAIN
+# Impact: simple per-event-minute density score
+# ============================================================
+def impact_score_for(event_dt_utc: datetime, minute_event_counts: Dict[str, int]) -> Dict[str, Any]:
+    minute_key = iso_minute(event_dt_utc)
+    before = int(minute_event_counts.get(minute_key, 0))
+    score = 1.0 / (1.0 + float(before))  # higher when bucket is sparse
+    return {
+        "bucket_minute_utc": minute_key,
+        "bucket_count_before": before,
+        "impact_score": score,
+    }
+
+
+# ============================================================
+# Main
 # ============================================================
 def main() -> int:
     # ----------------------------
-    # CONFIG (env-driven)
+    # Config
     # ----------------------------
     topic = os.environ.get("TOPIC", "signals")
     bootstrap = os.environ.get(
@@ -207,32 +238,31 @@ def main() -> int:
         "CHECKPOINT_PATH",
         os.path.expanduser(f"~/landing-zone/checkpoints/{topic}/offsets.json"),
     )
+    state_path = os.environ.get("STATE_PATH", os.path.expanduser("~/landing-zone/state/late_state.json"))
+    alerts_path = os.environ.get("ALERTS_PATH", os.path.expanduser("~/landing-zone/alerts/late_alerts.jsonl"))
     log_path = os.environ.get("LOG_PATH", os.path.expanduser("~/landing-zone/logs/landing-consumer.log"))
 
-    alerts_path = os.environ.get("ALERTS_PATH", os.path.expanduser("~/landing-zone/alerts/late_alerts.jsonl"))
-    state_path = os.environ.get("STATE_PATH", os.path.expanduser("~/landing-zone/state/late_state.json"))
-
     late_threshold_sec = int(os.environ.get("LATE_THRESHOLD_SEC", str(LATE_THRESHOLD_SEC_DEFAULT)))
+
     impact_threshold = float(os.environ.get("IMPACT_THRESHOLD", str(IMPACT_THRESHOLD_DEFAULT)))
-
-    ops_iqr_k = float(os.environ.get("OPS_IQR_K", str(OPS_IQR_K_DEFAULT)))
-    ops_min_samples = int(os.environ.get("OPS_MIN_SAMPLES", str(OPS_MIN_SAMPLES_DEFAULT)))
-    ops_window = int(os.environ.get("OPS_WINDOW", str(OPS_WINDOW_DEFAULT)))
-    ops_zero_iqr_floor_sec = int(os.environ.get("OPS_ZERO_IQR_FLOOR_SEC", str(OPS_ZERO_IQR_FLOOR_SEC_DEFAULT)))
-
     impact_window_minutes = int(os.environ.get("IMPACT_WINDOW_MINUTES", str(IMPACT_WINDOW_MINUTES_DEFAULT)))
+    min_bucket_count = int(os.environ.get("MIN_BUCKET_COUNT", str(MIN_BUCKET_COUNT_DEFAULT)))
 
-    # Ensure dirs exist
-    ensure_dir(os.path.dirname(log_path))
+    ops_late_window_minutes = int(os.environ.get("OPS_LATE_WINDOW_MINUTES", str(OPS_LATE_WINDOW_MINUTES_DEFAULT)))
+    ops_late_rate_threshold = float(os.environ.get("OPS_LATE_RATE_THRESHOLD", str(OPS_LATE_RATE_THRESHOLD_DEFAULT)))
+    ops_late_count_threshold = int(os.environ.get("OPS_LATE_COUNT_THRESHOLD", str(OPS_LATE_COUNT_THRESHOLD_DEFAULT)))
+
+    # Ensure dirs
     ensure_dir(os.path.dirname(checkpoint_path))
-    ensure_dir(os.path.dirname(alerts_path))
     ensure_dir(os.path.dirname(state_path))
+    ensure_dir(os.path.dirname(alerts_path))
+    ensure_dir(os.path.dirname(log_path))
     ensure_dir(landing_root)
     ensure_dir(delayed_root)
     ensure_dir(quarantine_root)
 
     # ----------------------------
-    # Logging helper
+    # Logging
     # ----------------------------
     def log(msg: str):
         ts = datetime.now(tz=timezone.utc).isoformat()
@@ -248,7 +278,7 @@ def main() -> int:
             os.fsync(af.fileno())
 
     # ----------------------------
-    # STARTUP CONFIG LOG (single place to see everything)
+    # Startup config log
     # ----------------------------
     log("========== Landing Consumer Configuration ==========")
     log(f"topic={topic}")
@@ -260,12 +290,12 @@ def main() -> int:
     log("---- Impact Policy ----")
     log(f"impact_threshold={impact_threshold}")
     log(f"impact_window_minutes={impact_window_minutes}")
+    log(f"min_bucket_count={min_bucket_count}")
 
-    log("---- Ops (Pipeline Health) Policy ----")
-    log(f"ops_iqr_k={ops_iqr_k}")
-    log(f"ops_min_samples={ops_min_samples}")
-    log(f"ops_window={ops_window}")
-    log(f"ops_zero_iqr_floor_sec={ops_zero_iqr_floor_sec}")
+    log("---- Ops Health Policy (GLOBAL rolling window) ----")
+    log(f"ops_late_window_minutes={ops_late_window_minutes}")
+    log(f"ops_late_rate_threshold={ops_late_rate_threshold}")
+    log(f"ops_late_count_threshold={ops_late_count_threshold}")
 
     log("---- Paths ----")
     log(f"landing_root={landing_root}")
@@ -277,24 +307,47 @@ def main() -> int:
     log("=====================================================")
 
     # ----------------------------
-    # DURABILITY/CHECKPOINT: load offsets + state
+    # Load checkpoint + state
     # ----------------------------
     ckpt = load_checkpoint(checkpoint_path)
     last_offsets = ckpt.get(topic, {})  # partition(str) -> last_offset(int)
 
-    # state tracks:
-    #   - lateness distribution per source (ops lane)
-    #   - per-minute counts (impact lane)
     state = load_json(state_path, default={})
-    source_lateness: Dict[str, List[int]] = state.get("source_lateness", {}) or {}
-    minute_counts: Dict[str, int] = state.get("minute_counts", {}) or {}
+
+    # Impact state: event-minute counts (retro bucket density)
+    minute_event_counts: Dict[str, int] = state.get("minute_event_counts", {}) or {}
+
+    # Ops state: ingest-minute totals and late totals (rolling health)
+    minute_ingest_total: Dict[str, int] = state.get("minute_ingest_total", {}) or {}
+    minute_ingest_late: Dict[str, int] = state.get("minute_ingest_late", {}) or {}
+
+    def prune_state(now_utc: datetime) -> None:
+        # Keep enough for both impact + ops; impact usually larger window.
+        keep_minutes = max(impact_window_minutes, ops_late_window_minutes) + 2
+        cutoff_ts = floor_to_minute(now_utc).timestamp() - (keep_minutes * 60)
+
+        def prune_map(dct: Dict[str, int]):
+            to_del = []
+            for k in list(dct.keys()):
+                try:
+                    dt = datetime.fromisoformat(k.replace("Z", "+00:00"))
+                    if dt.timestamp() < cutoff_ts:
+                        to_del.append(k)
+                except Exception:
+                    to_del.append(k)
+            for k in to_del:
+                dct.pop(k, None)
+
+        prune_map(minute_event_counts)
+        prune_map(minute_ingest_total)
+        prune_map(minute_ingest_late)
 
     # ----------------------------
-    # LOAD writers (3 routes)
+    # Writers
     # ----------------------------
-    writer_landing = PartitionedWriter(root=landing_root, topic=topic)
-    writer_delayed = PartitionedWriter(root=delayed_root, topic=topic)
-    writer_quarantine = PartitionedWriter(root=quarantine_root, topic=topic)
+    w_landing = PartitionedWriter(landing_root, topic)
+    w_delayed = PartitionedWriter(delayed_root, topic)
+    w_quarantine = PartitionedWriter(quarantine_root, topic)
 
     # ----------------------------
     # Shutdown handling
@@ -309,74 +362,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_stop)
 
     # ----------------------------
-    # State helpers
+    # EXTRACT: Kafka consumer (manual assign; no group)
     # ----------------------------
-    def prune_minute_counts(now_utc: datetime) -> None:
-        cutoff = floor_to_minute(now_utc).timestamp() - (impact_window_minutes * 60)
-        to_del = []
-        for k in list(minute_counts.keys()):
-            try:
-                dt = datetime.fromisoformat(k.replace("Z", "+00:00"))
-                if dt.timestamp() < cutoff:
-                    to_del.append(k)
-            except Exception:
-                to_del.append(k)
-        for k in to_del:
-            minute_counts.pop(k, None)
-
-    # ============================================================
-    # OPS LANE: lateness shift anomaly per source (median + IQR)
-    # ============================================================
-    def ops_anomaly_for(source: str, lateness_sec: int) -> Dict[str, Any]:
-        vals = source_lateness.get(source, [])
-        if len(vals) < ops_min_samples:
-            return {
-                "status_anomaly": False,
-                "reason": "insufficient_history",
-                "samples": len(vals),
-                "median": None,
-                "iqr": None,
-                "upper_bound": None,
-            }
-
-        med, q1, q3, iqr = median_iqr([float(x) for x in vals])
-
-        # Important fix: if baseline has IQR=0 (often all zeros),
-        # require a minimum floor so any tiny non-zero delay doesn't look "anomalous".
-        if iqr > 0:
-            upper = med + (ops_iqr_k * iqr)
-        else:
-            upper = med + float(ops_zero_iqr_floor_sec)
-
-        status_anom = float(lateness_sec) > upper
-
-        return {
-            "status_anomaly": bool(status_anom),
-            "reason": "lateness_shift",
-            "samples": len(vals),
-            "median": med,
-            "q1": q1,
-            "q3": q3,
-            "iqr": iqr,
-            "upper_bound": upper,
-        }
-
-    # ============================================================
-    # IMPACT LANE: global per-minute counts (simple "current situation" proxy)
-    # ============================================================
-    def impact_score_for(event_dt_utc: datetime) -> Dict[str, Any]:
-        minute_key = iso_minute(event_dt_utc)
-        count_before = int(minute_counts.get(minute_key, 0))
-        score = 1.0 / (1.0 + float(count_before))
-        return {
-            "bucket_minute_utc": minute_key,
-            "bucket_count_before": count_before,
-            "impact_score": score,
-        }
-
-    # ============================================================
-    # EXTRACT: Kafka consumer (manual partition assignment; no group)
-    # ============================================================
     consumer = KafkaConsumer(
         bootstrap_servers=bootstrap,
         group_id=None,
@@ -390,7 +377,7 @@ def main() -> int:
         max_poll_records=500,
     )
 
-    # Discover partitions + assign
+    # Discover partitions and assign
     parts = None
     while running and not parts:
         parts = consumer.partitions_for_topic(topic)
@@ -409,36 +396,36 @@ def main() -> int:
 
     # Seek from checkpoint
     for tp in tps:
-        part_str = str(tp.partition)
-        if part_str in last_offsets:
-            seek_to = last_offsets[part_str] + 1
+        p = str(tp.partition)
+        if p in last_offsets:
+            seek_to = last_offsets[p] + 1
             consumer.seek(tp, seek_to)
-            log(f"Seek {topic}[{part_str}] -> {seek_to} (from checkpoint)")
+            log(f"Seek {topic}[{p}] -> {seek_to} (from checkpoint)")
         else:
             consumer.seek_to_beginning(tp)
-            log(f"Seek {topic}[{part_str}] -> beginning (no checkpoint)")
+            log(f"Seek {topic}[{p}] -> beginning (no checkpoint)")
 
     log("Entering consume loop...")
 
-    # ============================================================
-    # MAIN LOOP: EXTRACT -> TRANSFORM -> AI DECISION -> LOAD -> CHECKPOINT
-    # ============================================================
+    # ----------------------------
+    # Main loop
+    # ----------------------------
     processed = 0
     while running:
-        records = consumer.poll(timeout_ms=1000)
-        if not records:
+        batch = consumer.poll(timeout_ms=1000)
+        if not batch:
             continue
 
-        for tp, msgs in records.items():
-            part_str = str(tp.partition)
-            last = int(last_offsets.get(part_str, -1))
+        for tp, msgs in batch.items():
+            p = str(tp.partition)
+            last = int(last_offsets.get(p, -1))
 
             for m in msgs:
-                # Idempotency on restart
+                # idempotent on restart
                 if m.offset <= last:
                     continue
 
-                # Parse payload JSON
+                # Parse message
                 raw = m.value
                 try:
                     payload = json.loads(raw)
@@ -447,30 +434,36 @@ def main() -> int:
                 except Exception:
                     payload = {"raw": raw}
 
-                # Compute event time + lateness
+                # Times
                 event_dt_utc = parse_event_dt(payload, m.timestamp)
                 ingest_dt_utc = datetime.now(tz=timezone.utc)
+
                 lateness_sec = int((ingest_dt_utc - event_dt_utc).total_seconds())
                 if lateness_sec < 0:
                     lateness_sec = 0
 
-                source = str(payload.get("source", "unknown"))
                 is_late = lateness_sec > late_threshold_sec
+                source = str(payload.get("source", "unknown"))
 
-                # Compute lane signals (only meaningful for late)
-                ops_info = ops_anomaly_for(source, lateness_sec) if is_late else {
-                    "status_anomaly": False,
-                    "reason": "not_late",
-                    "samples": len(source_lateness.get(source, [])),
-                    "median": None,
-                    "iqr": None,
-                    "upper_bound": None,
-                }
-                impact_info = impact_score_for(event_dt_utc) if is_late else {
-                    "bucket_minute_utc": iso_minute(event_dt_utc),
-                    "bucket_count_before": int(minute_counts.get(iso_minute(event_dt_utc), 0)),
-                    "impact_score": 0.0,
-                }
+                # ---- Ops health (GLOBAL rolling)
+                ops_info = ops_anomaly_rolling(
+                    now_utc=ingest_dt_utc,
+                    minute_total=minute_ingest_total,
+                    minute_late=minute_ingest_late,
+                    window_minutes=ops_late_window_minutes,
+                    rate_threshold=ops_late_rate_threshold,
+                    count_threshold=ops_late_count_threshold,
+                )
+
+                # ---- Impact only matters for late records (retro correction)
+                if is_late:
+                    impact_info = impact_score_for(event_dt_utc, minute_event_counts)
+                else:
+                    impact_info = {
+                        "bucket_minute_utc": iso_minute(event_dt_utc),
+                        "bucket_count_before": int(minute_event_counts.get(iso_minute(event_dt_utc), 0)),
+                        "impact_score": 0.0,
+                    }
 
                 # ----------------------------
                 # AI DECISION: routing
@@ -479,16 +472,25 @@ def main() -> int:
                     route = "landing"
                     reason = "on_time_or_within_threshold"
                 else:
+                    # Quarantine if rolling ops says pipeline unhealthy (late-rate burst),
+                    # OR if impact says this late record meaningfully changes a sparse bucket.
                     status_anom = bool(ops_info.get("status_anomaly", False))
                     impact_score = float(impact_info.get("impact_score", 0.0))
-                    if status_anom or impact_score >= impact_threshold:
+                    bucket_before = int(impact_info.get("bucket_count_before", 0))
+
+                    high_impact_ok = (bucket_before >= min_bucket_count) and (impact_score >= impact_threshold)
+
+                    if status_anom:
                         route = "quarantine"
-                        reason = "late_ops_anomaly" if status_anom else "late_high_impact"
+                        reason = "late_ops_health_anomaly"
+                    elif high_impact_ok:
+                        route = "quarantine"
+                        reason = "late_high_impact"
                     else:
                         route = "delayed"
-                        reason = "late_low_impact_and_stable_pipeline"
+                        reason = "late_low_impact_and_ops_ok"
 
-                # Enrich record
+                # Record enrichment
                 record = dict(payload)
                 record["_kafka"] = {
                     "topic": m.topic,
@@ -508,38 +510,50 @@ def main() -> int:
                 }
 
                 # ----------------------------
-                # LOAD: write routed output
+                # LOAD: write output
                 # ----------------------------
                 if route == "landing":
-                    out_path = writer_landing.write_jsonl(event_dt_utc, record)
+                    out_path = w_landing.write_jsonl(event_dt_utc, record)
                 elif route == "delayed":
-                    out_path = writer_delayed.write_jsonl(event_dt_utc, record)
+                    out_path = w_delayed.write_jsonl(event_dt_utc, record)
                 else:
-                    out_path = writer_quarantine.write_jsonl(event_dt_utc, record)
+                    out_path = w_quarantine.write_jsonl(event_dt_utc, record)
 
                 # ----------------------------
-                # UPDATE STATE (atomic)
+                # Update state (atomic)
                 # ----------------------------
-                mk = iso_minute(event_dt_utc)
-                minute_counts[mk] = int(minute_counts.get(mk, 0)) + 1
-                prune_minute_counts(ingest_dt_utc)
+                ingest_min = iso_minute(ingest_dt_utc)
+                event_min = iso_minute(event_dt_utc)
 
-                vals = source_lateness.get(source, [])
-                vals.append(lateness_sec)
-                if len(vals) > ops_window:
-                    vals = vals[-ops_window:]
-                source_lateness[source] = vals
+                # ops rolling counters (by ingest minute)
+                minute_ingest_total[ingest_min] = int(minute_ingest_total.get(ingest_min, 0)) + 1
+                if is_late:
+                    minute_ingest_late[ingest_min] = int(minute_ingest_late.get(ingest_min, 0)) + 1
 
-                atomic_write_json(state_path, {"source_lateness": source_lateness, "minute_counts": minute_counts})
+                # impact counters (by event minute)
+                minute_event_counts[event_min] = int(minute_event_counts.get(event_min, 0)) + 1
+
+                prune_state(ingest_dt_utc)
+
+                atomic_write_json(
+                    state_path,
+                    {
+                        "minute_event_counts": minute_event_counts,
+                        "minute_ingest_total": minute_ingest_total,
+                        "minute_ingest_late": minute_ingest_late,
+                    },
+                )
 
                 # ----------------------------
-                # CHECKPOINT AFTER durable write
+                # Checkpoint AFTER durable write
                 # ----------------------------
-                last_offsets[part_str] = m.offset
+                last_offsets[p] = m.offset
                 ckpt[topic] = last_offsets
                 atomic_write_json(checkpoint_path, ckpt)
 
-                # Alerts on quarantine
+                # ----------------------------
+                # Alerts (only quarantine)
+                # ----------------------------
                 if route == "quarantine":
                     alert = {
                         "ts_utc": ingest_dt_utc.isoformat(),
@@ -559,13 +573,14 @@ def main() -> int:
                 if processed == 1 or processed % 50 == 0:
                     log(
                         f"Processed {processed} route={route} lateness={lateness_sec}s "
-                        f"ops_anom={ops_info.get('status_anomaly')} impact={impact_info.get('impact_score'):.3f} wrote={out_path}"
+                        f"ops_anom={ops_info.get('status_anomaly')} late_rate={ops_info.get('late_rate',0):.3f} "
+                        f"impact={impact_info.get('impact_score',0):.3f} wrote={out_path}"
                     )
 
     log("Shutting down...")
-    writer_landing.close_all()
-    writer_delayed.close_all()
-    writer_quarantine.close_all()
+    w_landing.close_all()
+    w_delayed.close_all()
+    w_quarantine.close_all()
     consumer.close()
     log(f"Exited cleanly. Total processed: {processed}")
     return 0
