@@ -1,452 +1,270 @@
-[//]: # (# LAN Streaming Ingestion Platform)
+# 🚀 Dev Stream  
+# A Local-First Streaming Ingestion Platform
 
-[//]: # (**Pop!_OS + k3s + Kafka + Append-Only Landing Zone**)
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![Kafka](https://img.shields.io/badge/Kafka-Streaming-black)
+![Architecture](https://img.shields.io/badge/Architecture-Event%20Driven-blueviolet)
+![Storage](https://img.shields.io/badge/Storage-JSONL-orange)
+![Deployment](https://img.shields.io/badge/Deployment-On--Prem-lightgrey)
+![Orchestration](https://img.shields.io/badge/Orchestration-systemd-green)
 
-[//]: # ()
-[//]: # (- Last Updated: 2026-02-15)
+---
 
-[//]: # (- Owner: Edward J. Carter)
+## 📌 Overview
 
-[//]: # ()
-[//]: # (## Strategic View)
+Dev Stream is a **local-first streaming ingestion platform** designed to bridge real-time event streams into a durable, replayable data lake.
 
-[//]: # ()
-[//]: # (This project establishes a LAN-based streaming data ingestion platform designed to simulate production-grade event-driven architecture within a home lab environment.)
+The system consumes events from Kafka and materializes them into a **partitioned landing zone**, enabling downstream processing, analytics, and data platform workflows.
 
-[//]: # ()
-[//]: # (**The goal is to:**)
+This project emphasizes:
+- Data durability
+- Replayability
+- Decoupling of ingestion from processing
 
-[//]: # ()
-[//]: # (- Build a real message bus &#40;Kafka on k3s VM&#41;)
+---
 
-[//]: # (- Consume events from a distributed system)
+## 🎯 Problem Statement
 
-[//]: # (- Persist raw, append-only landing data)
+In many environments, especially hybrid or regulated systems:
 
-[//]: # (- Ensure restart safety and idempotency)
+- Raw event streams cannot be directly exposed downstream
+- Processing frameworks (Spark, Flink, etc.) should not own ingestion durability
+- Pipelines require **replayable, audit-ready data sources**
 
-[//]: # (- Operate services in a boot-safe, systemd-managed environment)
+Dev Stream addresses this by acting as a **persistent ingestion layer**, converting transient streams into durable datasets.
 
-[//]: # (- Lay the foundation for streaming transformations and analytics)
+---
 
-[//]: # (- This is not a demo script — it is a functional ingestion layer.)
+## 🧠 Key Concepts
 
-[//]: # ()
-[//]: # (## Current Architecture)
+### 1. Landing Zone as a First-Class Layer
+Instead of processing directly from Kafka, data is written to a structured landing zone:
 
-[//]: # (### Infrastructure Node &#40;k3s VM — 192.168.0.146&#41;)
+landing/<topic>/dt=YYYY-MM-DD/hr=HH/*.jsonl
 
-[//]: # (- Kafka &#40;NodePort: 30992&#41;)
+This enables:
+- Replayability
+- Partitioned processing
+- Time-based querying
 
-[//]: # (- Postgres &#40;NodePort: 30432&#41;)
+---
 
-[//]: # (- Topic: signals &#40;1 partition&#41;)
+### 2. Immutable, Append-Only Storage
 
-[//]: # ()
-[//]: # (### Pop!_OS &#40;Landing Host&#41;)
+- JSONL format (one record per line)
+- Append-only writes
+- No mutation of historical data
 
-[//]: # (- socat bridge ``localhost:9092 → 192.168.0.146:30992``)
+This ensures:
+- Auditability
+- Simplified downstream processing
+- Compatibility with batch and streaming frameworks
 
-[//]: # (- Kafka consumer service &#40;systemd user service&#41;)
+---
 
-[//]: # (- Append-only JSONL landing zone)
+### 3. Offset-Based Ingestion
 
-[//]: # (- Local offset checkpoint persistence)
+The system tracks Kafka offsets to ensure:
 
-[//]: # (- Boot-safe services &#40;loginctl enable-linger&#41;)
+- Controlled consumption
+- Restart-safe processing
+- Consistent ingestion behavior
 
-[//]: # ()
-[//]: # (```css)
+Offsets are persisted locally to support recovery.
 
-[//]: # (landing-zone/)
+---
 
-[//]: # (  landing/)
+### 4. Local Orchestration (systemd)
 
-[//]: # (    signals/)
+Services are managed using systemd (user-level), enabling:
 
-[//]: # (      dt=YYYY-MM-DD/)
+- Automatic restarts
+- Dependency management
+- Long-running ingestion processes
 
-[//]: # (        hr=HH/)
+---
 
-[//]: # (          signals-YYYYMMDD-HH.jsonl)
+## 🏗️ Architecture
 
-[//]: # (  checkpoints/)
+        ┌──────────────────────┐
+        │     Producers        │
+        │   (Event Sources)    │
+        └──────────┬───────────┘
+                   │
+                   ▼
+        ┌──────────────────────┐
+        │        Kafka         │
+        │   Topic: signals     │
+        └──────────┬───────────┘
+                   │
+                   ▼
+        ┌──────────────────────┐
+        │   Ingestion Service  │
+        │ (Kafka Consumer)     │
+        └──────────┬───────────┘
+                   │
+                   ▼
+        ┌──────────────────────┐
+        │    Landing Zone      │
+        │   (Partitioned JSONL)│
+        └──────────────────────┘
 
-[//]: # (    signals/)
+---
 
-[//]: # (      offsets.json)
+## 🔄 Data Flow
 
-[//]: # (  logs/)
+1. Producers emit events to Kafka (`signals` topic)  
+2. Consumer reads messages from Kafka  
+3. Events are written to JSONL files  
+4. Files are partitioned by date and hour  
+5. Offsets are checkpointed for recovery  
 
-[//]: # (  ```)
+---
 
-[//]: # ()
-[//]: # (### Characteristics)
+## 📂 Storage Model
 
-[//]: # (- Append-only JSONL)
+### Landing Zone Structure
 
-[//]: # (- Partitioned by UTC date/hour)
+landing/
+└── signals/
+    ├── dt=2026-03-01/
+    │   ├── hr=10/
+    │   │   └── signals-20260301-10.jsonl
+    │   └── hr=11/
+    └── dt=2026-03-02/
 
-[//]: # (- _kafka metadata embedded per record)
+---
 
-[//]: # (- Idempotent on restart)
+## ⚙️ System Components
 
-[//]: # (- Atomic checkpoint writes)
+### Kafka Consumer
 
-[//]: # (- fsync durability)
+Responsibilities:
+- Subscribe to topic(s)
+- Deserialize messages
+- Handle timestamps
+- Write to disk
+- Commit offsets
 
-[//]: # (- systemd managed)
+---
 
-[//]: # (- LAN distributed topology)
+### Checkpointing
 
-[//]: # ()
-[//]: # (## Lessons Learned)
+Location:
+- ~/landing-zone/checkpoints/<topic>/offsets.json
 
-[//]: # (### Kafka Advertised Listener Matters)
+Purpose:
+- Persist consumer progress
+- Enable restart-safe ingestion
 
-[//]: # (Kafka inside Kubernetes advertises internal DNS. \)
+---
 
-[//]: # (When accessed externally via NodePort, clients may fail unless:)
+### Logging
 
-[//]: # (- Advertised listeners are properly configured or)
+Location:
+- ~/landing-zone/logs/
 
-[//]: # (- A local DNS + socat workaround is used.)
+Tracks:
+- Consumer activity
+- Errors and failures
 
-[//]: # ()
-[//]: # (Takeaway: Distributed systems assume correct network topology.)
+---
 
-[//]: # ()
-[//]: # (### Local Checkpointing > Blind Auto-Commit)
+### systemd Services
 
-[//]: # ()
-[//]: # (Relying only on Kafka consumer groups is insufficient when:)
+Example services:
+- kafka-socat.service (network bridging)
+- landing-signals-consumer.service
 
-[//]: # (- You want local durability guarantees)
+Responsibilities:
+- Ensure continuous operation
+- Manage dependencies
+- Restart on failure
 
-[//]: # (- You want file-write-first semantics)
+---
 
-[//]: # ()
-[//]: # (`Writing → fsync → checkpoint → continue`)
+## ⚙️ Execution
 
-[//]: # ()
-[//]: # (creates deterministic recovery behavior.)
+### Start Ingestion
 
-[//]: # ()
-[//]: # ()
-[//]: # ()
-[//]: # (### Append-Only Simplicity Scales)
+Managed via systemd:
 
-[//]: # ()
-[//]: # (Starting with:)
+systemctl --user start landing-signals-consumer.service
 
-[//]: # ()
-[//]: # (- JSONL)
+---
 
-[//]: # ()
-[//]: # (- Partitioned directories)
+### Check Status
 
-[//]: # ()
-[//]: # (- Immutable writes)
+systemctl --user status landing-signals-consumer.service
 
-[//]: # ()
-[//]: # (- keeps the system transparent and debuggable.)
+---
 
-[//]: # ()
-[//]: # (- Premature complexity &#40;Spark, Flink, etc.&#41; is unnecessary at this stage.)
+### Logs
 
-[//]: # ()
-[//]: # ()
-[//]: # (## Current System Maturity)
+journalctl --user -u landing-signals-consumer.service -f
 
-[//]: # ()
-[//]: # (**What is solid:**)
+---
 
-[//]: # ()
-[//]: # (- Message bus operational)
+## ⚠️ Design Decisions
 
-[//]: # ()
-[//]: # (- Restart-safe ingestion)
+### Why Not Process Directly from Kafka?
 
-[//]: # ()
-[//]: # (- Partitioned landing)
+- Decouples ingestion from processing
+- Enables replayable pipelines
+- Supports multiple downstream consumers
 
-[//]: # ()
-[//]: # (- Boot-safe services)
+---
 
-[//]: # ()
-[//]: # (- Local durability guarantees)
+### Why JSONL?
 
-[//]: # ()
-[//]: # (- Clean folder structure)
+- Stream-friendly format
+- Easy to append
+- Compatible with Spark, Python, and CLI tools
 
-[//]: # ()
-[//]: # (- Scripted activation &#40;devmode landing&#41;)
+---
 
-[//]: # ()
-[//]: # (**What is not yet implemented:**)
+### Why Local Storage?
 
-[//]: # ()
-[//]: # (- Metrics / observability)
+- Supports on-prem / air-gapped environments
+- Reduces dependency on cloud infrastructure
+- Aligns with hybrid data platform patterns
 
-[//]: # ()
-[//]: # (- Dead-letter queue)
+---
 
-[//]: # ()
-[//]: # (- Multi-partition scaling)
+## ⚖️ Guarantees
 
-[//]: # ()
-[//]: # (- Schema enforcement)
+- At-least-once delivery (offset-based ingestion)
+- Partition-level ordering (Kafka guarantees)
+- Append-only durability
 
-[//]: # ()
-[//]: # (- Retention management)
+---
 
-[//]: # ()
-[//]: # (- Backpressure testing)
+## 🚧 Future Enhancements
 
-[//]: # ()
-[//]: # (- Streaming transforms)
+- Schema validation layer
+- Compression (e.g., gzip or parquet conversion)
+- Multi-topic ingestion
+- Centralized offset store
+- Cloud landing zone integration (S3-compatible)
 
-[//]: # ()
-[//]: # (## Path Ahead)
+---
 
-[//]: # (### Phase 1 – Hardening)
+## 🧑‍💻 Relationship to Other Systems
 
-[//]: # ()
-[//]: # (- Add metrics &#40;records/sec, lag&#41;)
+This project is designed to integrate with downstream platforms such as:
 
-[//]: # ()
-[//]: # (- Add consumer lag inspection)
+- Hybrid Metrics Platform (metrics aggregation and API layer)
+- PySpark pipelines (medallion architecture)
+- Data observability systems
 
-[//]: # ()
-[//]: # (- Add dead-letter handling for invalid JSON)
+---
 
-[//]: # ()
-[//]: # (- Move from single partition → 3 partitions)
+## 📎 Summary
 
-[//]: # ()
-[//]: # (- Improve Kafka advertised listeners &#40;remove socat workaround&#41;)
+Dev Stream provides:
 
-[//]: # ()
-[//]: # (### Phase 2 – Streaming Transform Layer)
+- A durable ingestion layer for event streams
+- A replayable, partitioned data source
+- A foundation for building scalable data platforms
 
-[//]: # ()
-[//]: # (Options:)
-
-[//]: # ()
-[//]: # (- Bronze/Silver streaming transforms &#40;Python&#41;)
-
-[//]: # ()
-[//]: # (- Spark Structured Streaming)
-
-[//]: # ()
-[//]: # (- Lightweight validation engine)
-
-[//]: # ()
-[//]: # (- Feature engineering on ingest)
-
-[//]: # ()
-[//]: # (- Online model scoring)
-
-[//]: # ()
-[//]: # (### Phase 3 – Producer Expansion)
-
-[//]: # ()
-[//]: # (- Deploy React click-stream app on second desktop)
-
-[//]: # ()
-[//]: # (- Emit structured event schema)
-
-[//]: # ()
-[//]: # (- Simulate real user telemetry)
-
-[//]: # ()
-[//]: # (- Introduce versioned event contracts)
-
-[//]: # ()
-[//]: # (### Phase 4 – Observability)
-
-[//]: # ()
-[//]: # (- Prometheus)
-
-[//]: # ()
-[//]: # (- Grafana)
-
-[//]: # ()
-[//]: # (- Kafka exporter)
-
-[//]: # ()
-[//]: # (- Disk growth monitoring)
-
-[//]: # ()
-[//]: # (- Landing file integrity checks)
-
-[//]: # ()
-[//]: # (## Strategic Direction)
-
-[//]: # ()
-[//]: # (This project is evolving into:)
-
-[//]: # ()
-[//]: # (A self-hosted distributed data engineering platform for streaming analytics experimentation.)
-
-[//]: # ()
-[//]: # (It is positioned to support:)
-
-[//]: # ()
-[//]: # (Clickstream ingestion)
-
-[//]: # ()
-[//]: # (Model drift detection)
-
-[//]: # ()
-[//]: # (Real-time feature pipelines)
-
-[//]: # ()
-[//]: # (RAG ingestion)
-
-[//]: # ()
-[//]: # (ISR-style event streaming simulations)
-
-[//]: # ()
-[//]: # (Production-style architecture experimentation)
-
-[//]: # ()
-[//]: # (## Summary)
-
-[//]: # ()
-[//]: # (As of 2026-02-15, the core ingestion foundation is complete:)
-
-[//]: # ()
-[//]: # (Kafka on LAN)
-
-[//]: # ()
-[//]: # (Durable append-only landing)
-
-[//]: # ()
-[//]: # (Checkpoint-safe consumer)
-
-[//]: # ()
-[//]: # (Boot-safe services)
-
-[//]: # ()
-[//]: # (Distributed topology validated)
-
-[//]: # ()
-[//]: # (The system is stable and ready for the next architectural layer.)
-
-#  AI-Aware Streaming Pipeline (LAN Lab)
-
-- Last Updated: 2026-02-15
-- Owner: Edward J. Carter
-
-## Strategic End State
-
-The objective of this project is to build an AI/ML-integrated streaming pipeline that evaluates incoming data in real time and determines how to handle late, anomalous, or drift-inducing events based on measurable model impact.
-
-All current work (Kafka, landing zone, boot-safe services, LAN topology) is foundational infrastructure to support intelligent, model-driven decision logic inside the pipeline.
-
-## Current State (Infrastructure Phase)
-- Message Bus
-
-- Kafka running on k3s VM (LAN)
-
-- Topic: signals
-
-- NodePort exposure verified
-
-- External connectivity via socat bridge
-
-## Landing Zone
-
-- Append-only JSONL
-
-- Partitioned by date/hour
-
-- Idempotent consumer
-
-- Local offset checkpointing
-
-- fsync durability
-
-- Boot-safe via systemd user services
-
-## Operational Characteristics
-
-- Restart-safe ingestion
-
-- Deterministic recovery
-
-- Fully self-hosted on LAN
-
-- Dev-mode activation (devmode landing)
-
-## Why This Exists
-
-Before AI-driven decision logic can exist in a streaming system, the pipeline must guarantee:
-
-- Deterministic ingestion
-
-- Durable landing
-
-- Replay capability
-
-- Offset control
-
-- Boot-safe operation
-
-- Controlled distributed topology
-
-The current phase establishes those guarantees.
- 
-# Lessons Learned
-
-- Kafka advertised listeners must match real network topology.
-
-- Local checkpoint control provides stronger guarantees than blind auto-commit.
-
-- systemd user services + linger turn a workstation into a data appliance.
-
-- Append-only raw ingestion keeps the system transparent and debuggable.
-
-- Even on a LAN, distributed systems behave like distributed systems.
-
-## Path Ahead (AI Integration Phase)
-**Phase 1 – Streaming Evaluation Layer**
-
-- Introduce model scoring inside consumer
-
-- Measure model delta impact per event
-
-- Detect late data beyond window threshold
-
-- Track concept drift signals
-
-**Phase 2 – Decision Logic**
-
-- Based on model impact:
-
-- Accept into primary dataset
-
-- Route to delayed processing
-
-- Trigger model retrain
-
-- Flag for investigation
-
-- Drop or quarantine
-
-**Phase 3 – Feedback Loop**
-
-- Measure performance degradation
-
-- Adaptive window tuning
-
-- Online evaluation metrics
-
-- Model-aware pipeline branching
-
-# Summary
-
-As of 2026-02-15, the infrastructure foundation is complete.
-
-The next milestone is integrating AI/ML into the streaming layer so the pipeline can reason about data quality, lateness, and model impact — and act autonomously.
+It represents the **ingestion backbone** of a larger hybrid data architecture.
